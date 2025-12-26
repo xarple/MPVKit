@@ -70,7 +70,7 @@ jobs:
       
       - name: Build LGPL version
         run: |
-          make build version=${{ env.RELEASE_VERSION }}
+          make build platform=ios,macos version=${{ env.RELEASE_VERSION }}
       
       
       - name: Update Package.swift
