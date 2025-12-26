@@ -78,85 +78,165 @@ index 0000000000000000000000000000000000000000..445b907f795b24b8df80389394d4ae7b
 + * You should have received a copy of the GNU Lesser General Public
 + * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
 + */
-+
 +#include <CoreGraphics/CoreGraphics.h>
 +#include <QuartzCore/CAMetalLayer.h>
++#include <Metal/Metal.h>
++#include <IOSurface/IOSurfaceRef.h>
 +#include <MoltenVK/mvk_vulkan.h>
-+
 +#include "common.h"
 +#include "context.h"
 +#include "utils.h"
++#include "mpv/client.h"
++
++static mpv_moltenvk_frame_callback g_frame_callback = NULL;
++static void *g_frame_callback_context = NULL;
++static IOSurfaceRef g_shared_surface = NULL;
++static id<MTLTexture> g_shared_texture = nil;
++static id<MTLDevice> g_mtl_device = nil;
++static id<MTLCommandQueue> g_mtl_command_queue = nil;
++static int g_surface_width = 0;
++static int g_surface_height = 0;
++
++void mpv_moltenvk_set_frame_callback(mpv_moltenvk_frame_callback cb, void *ctx) {
++    g_frame_callback = cb;
++    g_frame_callback_context = ctx;
++}
++
++void *mpv_moltenvk_get_shared_surface(void) {
++    return (void *)g_shared_surface;
++}
++
++void mpv_moltenvk_get_surface_size(int *w, int *h) {
++    if (w) *w = g_surface_width;
++    if (h) *h = g_surface_height;
++}
++
++static bool create_shared_surface(int width, int height) {
++    if (g_shared_surface && g_surface_width == width && g_surface_height == height)
++        return true;
++    if (g_shared_surface) { CFRelease(g_shared_surface); g_shared_surface = NULL; }
++    if (g_shared_texture) { g_shared_texture = nil; }
++    NSDictionary *props = @{
++        (__bridge NSString *)kIOSurfaceWidth: @(width),
++        (__bridge NSString *)kIOSurfaceHeight: @(height),
++        (__bridge NSString *)kIOSurfaceBytesPerElement: @(4),
++        (__bridge NSString *)kIOSurfacePixelFormat: @('BGRA'),
++        (__bridge NSString *)kIOSurfaceBytesPerRow: @(width * 4),
++        (__bridge NSString *)kIOSurfaceAllocSize: @(width * height * 4),
++    };
++    g_shared_surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
++    if (!g_shared_surface) return false;
++    if (g_mtl_device) {
++        MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:width height:height mipmapped:NO];
++        desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
++        desc.storageMode = MTLStorageModeShared;
++        g_shared_texture = [g_mtl_device newTextureWithDescriptor:desc iosurface:g_shared_surface plane:0];
++    }
++    g_surface_width = width;
++    g_surface_height = height;
++    return g_shared_surface != NULL;
++}
 +
 +struct priv {
 +    struct mpvk_ctx vk;
 +    CAMetalLayer *layer;
++    bool frame_capture_enabled;
 +};
 +
-+static void moltenvk_uninit(struct ra_ctx *ctx)
-+{
++static void moltenvk_uninit(struct ra_ctx *ctx) {
 +    struct priv *p = ctx->priv;
 +    ra_vk_ctx_uninit(ctx);
 +    mpvk_uninit(&p->vk);
++    if (g_shared_surface) { CFRelease(g_shared_surface); g_shared_surface = NULL; }
++    g_shared_texture = nil;
++    g_mtl_command_queue = nil;
++    g_mtl_device = nil;
++    g_frame_callback = NULL;
++    g_frame_callback_context = NULL;
++    g_surface_width = 0;
++    g_surface_height = 0;
 +}
 +
-+static bool moltenvk_init(struct ra_ctx *ctx)
-+{
++static void moltenvk_swap_buffers(struct ra_ctx *ctx) {
++    struct priv *p = ctx->priv;
++    if (!g_frame_callback || !p->frame_capture_enabled) return;
++    CGSize size = p->layer.drawableSize;
++    int width = (int)size.width;
++    int height = (int)size.height;
++    if (!create_shared_surface(width, height)) return;
++    if (g_mtl_command_queue && g_shared_texture) {
++        id<CAMetalDrawable> drawable = [p->layer nextDrawable];
++        if (drawable) {
++            id<MTLCommandBuffer> cb = [g_mtl_command_queue commandBuffer];
++            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
++            [blit copyFromTexture:drawable.texture sourceSlice:0 sourceLevel:0
++                     sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width,height,1)
++                        toTexture:g_shared_texture destinationSlice:0 destinationLevel:0
++                destinationOrigin:MTLOriginMake(0,0,0)];
++            [blit endEncoding];
++            [cb commit];
++            [cb waitUntilCompleted];
++            g_frame_callback(g_frame_callback_context, (void *)g_shared_surface, width, height);
++        }
++    }
++}
++
++static bool moltenvk_init(struct ra_ctx *ctx) {
 +    struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
 +    struct mpvk_ctx *vk = &p->vk;
 +    int msgl = ctx->opts.probing ? MSGL_V : MSGL_ERR;
-+
 +    if (ctx->vo->opts->WinID == -1) {
 +        MP_MSG(ctx, msgl, "WinID missing\n");
 +        goto fail;
 +    }
-+
 +    if (!mpvk_init(vk, ctx, VK_EXT_METAL_SURFACE_EXTENSION_NAME))
 +        goto fail;
-+
 +    p->layer = (__bridge CAMetalLayer *)(intptr_t)ctx->vo->opts->WinID;
++    g_mtl_device = p->layer.device;
++    if (!g_mtl_device) {
++        g_mtl_device = MTLCreateSystemDefaultDevice();
++        p->layer.device = g_mtl_device;
++    }
++    g_mtl_command_queue = [g_mtl_device newCommandQueue];
++    p->frame_capture_enabled = (g_frame_callback != NULL);
++    p->layer.framebufferOnly = NO;
 +    VkMetalSurfaceCreateInfoEXT info = {
-+         .sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT,
-+         .pLayer = p->layer,
++        .sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT,
++        .pLayer = p->layer,
 +    };
-+
-+    struct ra_ctx_params params = {0};
-+
++    struct ra_ctx_params params = { .swap_buffers = moltenvk_swap_buffers };
 +    VkInstance inst = vk->vkinst->instance;
 +    VkResult res = vkCreateMetalSurfaceEXT(inst, &info, NULL, &vk->surface);
 +    if (res != VK_SUCCESS) {
 +        MP_MSG(ctx, msgl, "Failed creating MoltenVK surface\n");
 +        goto fail;
 +    }
-+
 +    if (!ra_vk_ctx_init(ctx, vk, params, VK_PRESENT_MODE_FIFO_KHR))
 +        goto fail;
-+
 +    return true;
 +fail:
 +    moltenvk_uninit(ctx);
 +    return false;
 +}
 +
-+static bool moltenvk_reconfig(struct ra_ctx *ctx)
-+{
++static bool moltenvk_reconfig(struct ra_ctx *ctx) {
 +    struct priv *p = ctx->priv;
 +    CGSize s = p->layer.drawableSize;
 +    ra_vk_ctx_resize(ctx, s.width, s.height);
 +    return true;
 +}
 +
-+static int moltenvk_control(struct ra_ctx *ctx, int *events, int request, void *arg)
-+{
++static int moltenvk_control(struct ra_ctx *ctx, int *events, int request, void *arg) {
 +    return VO_NOTIMPL;
 +}
 +
 +const struct ra_ctx_fns ra_ctx_vulkan_moltenvk = {
-+    .type           = "vulkan",
-+    .name           = "moltenvk",
-+    .reconfig       = moltenvk_reconfig,
-+    .control        = moltenvk_control,
-+    .init           = moltenvk_init,
-+    .uninit         = moltenvk_uninit,
++    .type     = "vulkan",
++    .name     = "moltenvk",
++    .reconfig = moltenvk_reconfig,
++    .control  = moltenvk_control,
++    .init     = moltenvk_init,
++    .uninit   = moltenvk_uninit,
 +};
 diff --git forkSrcPrefix/meson.options forkDstPrefix/meson.options
 index dae0a333ef71b75a6bb36a236de7feebd99bda40..6ed28af20a09501b4997ca81e86bb198e75327fd 100644
@@ -170,3 +250,21 @@ index dae0a333ef71b75a6bb36a236de7feebd99bda40..6ed28af20a09501b4997ca81e86bb198
  
  # macOS features
  option('macos-10-15-4-features', type: 'feature', value: 'auto', description: 'macOS 10.15.4 SDK Features')
+ diff --git forkSrcPrefix/include/mpv/client.h forkSrcPrefix/include/mpv/client.h
+index 1234567..abcdef0 100644
+--- forkSrcPrefix/include/mpv/client.h
++++ forkSrcPrefix/include/mpv/client.h
+@@ -1837,6 +1837,12 @@ MPV_EXPORT int mpv_hook_add(mpv_handle *ctx, uint64_t reply_userdata,
+  * @return error code
+  */
+ MPV_EXPORT int mpv_hook_continue(mpv_handle *ctx, uint64_t id);
+ 
++/* MoltenVK frame capture API for CIFilter integration (Apple platforms) */
++typedef void (*mpv_moltenvk_frame_callback)(void *ctx, void *surface, int w, int h);
++MPV_EXPORT void mpv_moltenvk_set_frame_callback(mpv_moltenvk_frame_callback cb, void *ctx);
++MPV_EXPORT void *mpv_moltenvk_get_shared_surface(void);
++MPV_EXPORT void mpv_moltenvk_get_surface_size(int *w, int *h);
++
+ #if MPV_ENABLE_DEPRECATED
+ 
+ /**
