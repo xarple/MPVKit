@@ -61,12 +61,11 @@ new file mode 100644
 index 0000000..5434dbe
 --- /dev/null
 +++ b/video/out/vulkan/context_moltenvk.m
-@@ -0,0 +1,161 @@
-+/* MoltenVK context for mpv with IOSurface frame capture. License: LGPL v2.1+ */
+@@ -0,0 +1,152 @@
++/* MoltenVK context for mpv with MTLTexture frame capture. License: LGPL v2.1+ */
 +#include <CoreGraphics/CoreGraphics.h>
 +#include <QuartzCore/CAMetalLayer.h>
 +#include <Metal/Metal.h>
-+#include <IOSurface/IOSurfaceRef.h>
 +#include <MoltenVK/mvk_vulkan.h>
 +#include "common.h"
 +#include "context.h"
@@ -75,51 +74,44 @@ index 0000000..5434dbe
 +
 +static mpv_moltenvk_frame_callback g_frame_callback = NULL;
 +static void *g_frame_callback_context = NULL;
-+static IOSurfaceRef g_shared_surface = NULL;
 +static id<MTLTexture> g_shared_texture = nil;
 +static id<MTLDevice> g_mtl_device = nil;
 +static id<MTLCommandQueue> g_mtl_command_queue = nil;
-+static int g_surface_width = 0;
-+static int g_surface_height = 0;
++static int g_texture_width = 0;
++static int g_texture_height = 0;
++static MTLPixelFormat g_texture_format = MTLPixelFormatInvalid;
 +
 +void mpv_moltenvk_set_frame_callback(mpv_moltenvk_frame_callback cb, void *ctx) {
 +    g_frame_callback = cb;
 +    g_frame_callback_context = ctx;
 +}
 +
-+void *mpv_moltenvk_get_shared_surface(void) {
-+    return (void *)g_shared_surface;
++void *mpv_moltenvk_get_shared_texture(void) {
++    return (__bridge void *)g_shared_texture;
 +}
 +
-+void mpv_moltenvk_get_surface_size(int *w, int *h) {
-+    if (w) *w = g_surface_width;
-+    if (h) *h = g_surface_height;
++void mpv_moltenvk_get_texture_size(int *w, int *h) {
++    if (w) *w = g_texture_width;
++    if (h) *h = g_texture_height;
 +}
 +
-+static bool create_shared_surface(int width, int height) {
-+    if (g_shared_surface && g_surface_width == width && g_surface_height == height)
++static bool create_shared_texture(int width, int height, MTLPixelFormat format) {
++    if (g_shared_texture && g_texture_width == width && g_texture_height == height && g_texture_format == format)
 +        return true;
-+    if (g_shared_surface) { CFRelease(g_shared_surface); g_shared_surface = NULL; }
-+    if (g_shared_texture) { g_shared_texture = nil; }
-+    NSDictionary *props = @{
-+        (__bridge NSString *)kIOSurfaceWidth: @(width),
-+        (__bridge NSString *)kIOSurfaceHeight: @(height),
-+        (__bridge NSString *)kIOSurfaceBytesPerElement: @(4),
-+        (__bridge NSString *)kIOSurfacePixelFormat: @('BGRA'),
-+        (__bridge NSString *)kIOSurfaceBytesPerRow: @(width * 4),
-+        (__bridge NSString *)kIOSurfaceAllocSize: @(width * height * 4),
-+    };
-+    g_shared_surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
-+    if (!g_shared_surface) return false;
-+    if (g_mtl_device) {
-+        MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:width height:height mipmapped:NO];
-+        desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-+        desc.storageMode = MTLStorageModeShared;
-+        g_shared_texture = [g_mtl_device newTextureWithDescriptor:desc iosurface:g_shared_surface plane:0];
++    if (g_shared_texture) {
++        g_shared_texture = nil;
 +    }
-+    g_surface_width = width;
-+    g_surface_height = height;
-+    return g_shared_surface != NULL;
++    if (!g_mtl_device) return false;
++    
++    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:width height:height mipmapped:NO];
++    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
++    desc.storageMode = MTLStorageModeShared;
++    g_shared_texture = [g_mtl_device newTextureWithDescriptor:desc];
++    
++    g_texture_width = width;
++    g_texture_height = height;
++    g_texture_format = format;
++    return g_shared_texture != nil;
 +}
 +
 +struct priv {
@@ -132,37 +124,38 @@ index 0000000..5434dbe
 +    struct priv *p = ctx->priv;
 +    ra_vk_ctx_uninit(ctx);
 +    mpvk_uninit(&p->vk);
-+    if (g_shared_surface) { CFRelease(g_shared_surface); g_shared_surface = NULL; }
 +    g_shared_texture = nil;
 +    g_mtl_command_queue = nil;
 +    g_mtl_device = nil;
 +    g_frame_callback = NULL;
 +    g_frame_callback_context = NULL;
-+    g_surface_width = 0;
-+    g_surface_height = 0;
++    g_texture_width = 0;
++    g_texture_height = 0;
++    g_texture_format = MTLPixelFormatInvalid;
 +}
 +
 +static void moltenvk_swap_buffers(struct ra_ctx *ctx) {
 +    struct priv *p = ctx->priv;
 +    if (!g_frame_callback || !p->frame_capture_enabled) return;
-+    CGSize size = p->layer.drawableSize;
-+    int width = (int)size.width;
-+    int height = (int)size.height;
-+    if (!create_shared_surface(width, height)) return;
++    
++    id<CAMetalDrawable> drawable = [p->layer nextDrawable];
++    if (!drawable) return;
++    
++    id<MTLTexture> srcTexture = drawable.texture;
++    int width = (int)srcTexture.width;
++    int height = (int)srcTexture.height;
++    MTLPixelFormat format = srcTexture.pixelFormat;
++    
++    if (!create_shared_texture(width, height, format)) return;
++    
 +    if (g_mtl_command_queue && g_shared_texture) {
-+        id<CAMetalDrawable> drawable = [p->layer nextDrawable];
-+        if (drawable) {
-+            id<MTLCommandBuffer> cb = [g_mtl_command_queue commandBuffer];
-+            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-+            [blit copyFromTexture:drawable.texture sourceSlice:0 sourceLevel:0
-+                     sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width,height,1)
-+                        toTexture:g_shared_texture destinationSlice:0 destinationLevel:0
-+                destinationOrigin:MTLOriginMake(0,0,0)];
-+            [blit endEncoding];
-+            [cb commit];
-+            [cb waitUntilCompleted];
-+            g_frame_callback(g_frame_callback_context, (void *)g_shared_surface, width, height);
-+        }
++        id<MTLCommandBuffer> cb = [g_mtl_command_queue commandBuffer];
++        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
++        [blit copyFromTexture:srcTexture toTexture:g_shared_texture];
++        [blit endEncoding];
++        [cb commit];
++        [cb waitUntilCompleted];
++        g_frame_callback(g_frame_callback_context, (__bridge void *)g_shared_texture, width, height);
 +    }
 +}
 +
