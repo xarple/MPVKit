@@ -60,8 +60,8 @@ diff --git forkSrcPrefix/video/out/vulkan/context_moltenvk.m forkDstPrefix/video
 new file mode 100644
 index 0000000..5434dbe
 --- /dev/null
-+++ b/video/out/vulkan/context_moltenvk.m
-@@ -0,0 +1,152 @@
++++ forkSrcPrefix/video/out/vulkan/context_moltenvk.m
+@@ -0,0 +1,154 @@
 +/* MoltenVK context for mpv with MTLTexture frame capture. License: LGPL v2.1+ */
 +#include <CoreGraphics/CoreGraphics.h>
 +#include <QuartzCore/CAMetalLayer.h>
@@ -216,6 +216,7 @@ index 0000000..5434dbe
 +    .init     = moltenvk_init,
 +    .uninit   = moltenvk_uninit,
 +};
++
 diff --git forkSrcPrefix/meson.options forkDstPrefix/meson.options
 index dae0a333ef71b75a6bb36a236de7feebd99bda40..6ed28af20a09501b4997ca81e86bb198e75327fd 100644
 --- forkSrcPrefix/meson.options
